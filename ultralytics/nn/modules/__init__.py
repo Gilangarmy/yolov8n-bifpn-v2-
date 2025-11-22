@@ -17,7 +17,7 @@ Examples:
     >>> subprocess.run(f"onnxslim {f} {f} && open {f}", shell=True, check=True)  # pip install onnxslim
 """
 
-from ultralytics.nn.bifpn import BiFPN, BiFPN_Node, BiFPN_Layer, SeparableConv2d
+from ultralytics.nn.bifpn import BiFPN
 from .block import (
     C1,
     C2,

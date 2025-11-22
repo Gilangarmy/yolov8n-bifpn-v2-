@@ -10,7 +10,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.bifpn import BiFPN, BiFPN_Node, BiFPN_Layer, SeparableConv2d
+# Di tasks.py - HANYA import BiFPN saja
+from ultralytics.nn.bifpn import BiFPN
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -1622,12 +1623,15 @@ def parse_model(d, ch, verbose=True):
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
-        # Update parse_model function
-        elif m in Concat:
+        elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        # Dalam parse_model function:
         elif m is BiFPN:
-            # BiFPN mengambil [p3, p4, p5] dan output [p3, p4, p5]
-            c2 = [ch[f[0]], ch[f[1]], ch[f[2]]]  # Output channels untuk P3, P4, P5
+            # BiFPN: args = [64, 3] -> channels, num_layers (sesuai EfficientDet-D0)
+            channels = args[0]  # 64 channels sesuai paper
+            num_layers = args[1] if len(args) > 1 else 3  # 3 layers untuk D0
+            # BiFPN output 3 feature maps untuk YOLO Detect head
+            c2 = [256, 512, 1024]  # P3, P4, P5 output channels   
         elif m in frozenset(
             {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):
@@ -1636,23 +1640,6 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
                 m.legacy = legacy
-        elif m is BiFPN:
-            # BiFPN(args) → args: [channels] atau [channels, repeats]
-            if len(args) == 1:
-                c2 = args[0]       # output channels
-            elif len(args) == 2:
-                c2 = args[0]       # channels, repeats
-            else:
-                raise ValueError(f"BiFPN expects args=[channels] or [channels,repeats], got {args}")
-
-            # Semua input dibuat memiliki channel sama
-            # karena BiFPN harus menerima P3,P4,P5 dengan channel identik
-            for x in (f if isinstance(f, list) else [f]):
-                ch[x] = c2
-
-            # Output satu node dengan channel = c2
-            ch.append(c2)
-            continue
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
         elif m is CBLinear:
