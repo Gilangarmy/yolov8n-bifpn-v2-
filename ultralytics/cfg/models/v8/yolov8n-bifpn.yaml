@@ -28,13 +28,5 @@ head:
 - [9, 1, Conv, [256, 1, 1]] # proj P5
 
 
-- [[10,11,12], 1, BiFPN, [256, 2]] # dua lapis BiFPN
-
-
-# hasil BiFPN keluar sebagai 3 fitur P3',P4',P5'
-- [13, 1, Identity, []] # P3'
-- [13, 1, Identity, []] # P4'
-- [13, 1, Identity, []] # P5'
-
-
-- [[14,15,16], 1, Detect, [nc]]
+- [[10,11,12], 1, BiFPN, [256, 2]]  # node 13
+- [13, 1, Detect, [nc]]             # langsung pakai output BiFPN
