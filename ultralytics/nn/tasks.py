@@ -1627,11 +1627,18 @@ def parse_model(d, ch, verbose=True):
             c2 = sum(ch[x] for x in f)
         # Dalam parse_model function:
         elif m is BiFPN:
-            # BiFPN: args = [64, 3] -> channels, num_layers (sesuai EfficientDet-D0)
-            channels = args[0]  # 64 channels sesuai paper
-            num_layers = args[1] if len(args) > 1 else 3  # 3 layers untuk D0
-            # BiFPN output 3 feature maps untuk YOLO Detect head
-            c2 = [256, 512, 1024]  # P3, P4, P5 output channels   
+        # f adalah list index fitur input (misal [15,18,21])
+        # args berupa: [channels, num_layers]
+            c_in = [ch[x] for x in f]
+        # kita samakan seluruh channel fitur input dengan channel argumen
+            c2 = args[0] # output channels per level (P3,P4,P5)
+        # set channel output untuk 3 level BiFPN
+            for i, fi in enumerate(f):
+                ch[fi] = c2
+        # modul menghasilkan 3 fitur, sehingga output = 3 fitur berturut
+        # tetapi Ultralytics bertumpu pada 1 output node, jadi kita handle sebagai fitur list
+        # assign jumlah channel ke current node (index i)
+            ch[i] = c2   
         elif m in frozenset(
             {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):

@@ -1,14 +1,31 @@
-# ultralytics/nn/bifpn.py
+"""
+BiFPN asli (simplified, faithful implementation) untuk integrasi ke YOLOv8 (Ultralytics).
+File ini mendefinisikan:
+- SeparableConvBlock: depthwise separable conv + BN + SiLU
+- WeightedAdd: fast normalized weighted fusion (ReLU->normalize)
+- BiFPNBlock: satu iterasi top-down + bottom-up
+- BiFPN: stack beberapa BiFPNBlock (repeats)
+
+Catatan integrasi:
+- Masukkan file ini ke: ultralytics/nn/bifpn.py
+- Import di tasks.py: from ultralytics.nn.bifpn import BiFPN
+- Pastikan fitur masuk (P3,P4,P5) memiliki jumlah channel yang sama (biasanya via 1x1 conv sebelumnya) — saya menambahkan ops untuk menyesuaikan channel jika perlu.
+- Di YAML, ganti node-concat/concat2/concat3 yang Anda buat sebelumnya dengan 1 modul BiFPN yang mengambil list fitur input. Contoh penggunaan di parse_model: treat BiFPN as a module that consumes multiple feature maps and outputs same-numbered maps.
+
+Implementasi ini berfokus ke kejelasan dan kompatibilitas dengan pipeline PyTorch/Ultralytics.
+"""
+
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SeparableConv2d(nn.Module):
-    """Depthwise separable convolution - sesuai paper EfficientDet"""
+
+class SeparableConvBlock(nn.Module):
+    """Depthwise separable conv -> BN -> SiLU"""
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-        super(SeparableConv2d, self).__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, 
-                                 stride, padding, groups=in_channels, bias=False)
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding, groups=in_channels, bias=False)
         self.pointwise = nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=False)
         self.bn = nn.BatchNorm2d(out_channels)
         self.act = nn.SiLU()
@@ -17,141 +34,136 @@ class SeparableConv2d(nn.Module):
         x = self.depthwise(x)
         x = self.pointwise(x)
         x = self.bn(x)
-        x = self.act(x)
-        return x
+        return self.act(x)
 
-class BiFPN_Node(nn.Module):
-    """Single BiFPN node dengan fast normalized fusion - sesuai paper"""
-    def __init__(self, channels, num_inputs=2, epsilon=1e-4):
-        super(BiFPN_Node, self).__init__()
-        self.epsilon = epsilon
-        self.num_inputs = num_inputs
-        self.w = nn.Parameter(torch.ones(num_inputs, dtype=torch.float32), requires_grad=True)
-        self.conv = SeparableConv2d(channels, channels)
-        
+
+class WeightedAdd(nn.Module):
+    """Fast normalized fusion used in BiFPN.
+    Uses ReLU on weights then normalizes by sum + eps.
+    Accepts a list of tensors and returns weighted sum.
+    """
+    def __init__(self, num_inputs, eps=1e-4):
+        super().__init__()
+        self.eps = eps
+        # initialize with equal importance
+        w = torch.ones(num_inputs, dtype=torch.float32)
+        self.w = nn.Parameter(w)
+
     def forward(self, inputs):
-        # Fast normalized fusion - Equation (1) dalam paper
+        # inputs: list of tensors
         w = F.relu(self.w)
-        weights = w / (torch.sum(w, dim=0) + self.epsilon)
-        
-        # Weighted fusion - Equation (2) dalam paper
-        fused = 0
-        for i in range(self.num_inputs):
-            fused += weights[i] * inputs[i]
-        
-        # Feature refinement dengan depthwise separable conv
-        return self.conv(fused)
+        weight = w / (torch.sum(w) + self.eps)
+        out = 0
+        for i, t in enumerate(inputs):
+            out = out + weight[i] * t
+        return out
 
-class BiFPN_Layer(nn.Module):
-    """One complete BiFPN layer - Figure 3 dalam paper"""
-    def __init__(self, channels, epsilon=1e-4):
-        super(BiFPN_Layer, self).__init__()
-        self.channels = channels
-        self.epsilon = epsilon
-        
-        # Top-down path nodes (P7->P6->P5->P4->P3) - sesuai paper
-        self.td_p6 = BiFPN_Node(channels, 2)  # P6 + P7_up
-        self.td_p5 = BiFPN_Node(channels, 2)  # P5 + P6_up  
-        self.td_p4 = BiFPN_Node(channels, 2)  # P4 + P5_up
-        self.td_p3 = BiFPN_Node(channels, 2)  # P3 + P4_up
-        
-        # Bottom-up path nodes (P3->P4->P5->P6->P7) - sesuai paper
-        self.bu_p4 = BiFPN_Node(channels, 3)  # P4 + P4_td + P3_out
-        self.bu_p5 = BiFPN_Node(channels, 3)  # P5 + P5_td + P4_out
-        self.bu_p6 = BiFPN_Node(channels, 3)  # P6 + P6_td + P5_out
-        self.bu_p7 = BiFPN_Node(channels, 2)  # P7 + P6_out
-        
-    def forward(self, features):
-        # Unpack features: [P3, P4, P5, P6, P7] - 5 levels sesuai paper
-        p3, p4, p5, p6, p7 = features
-        
-        # TOP-DOWN PATH - sesuai Figure 3(a)
-        # P7 -> P6_td
-        p7_to_p6 = F.interpolate(p7, size=p6.shape[2:], mode='nearest')
-        p6_td = self.td_p6([p6, p7_to_p6])
-        
-        # P6_td -> P5_td  
-        p6_to_p5 = F.interpolate(p6_td, size=p5.shape[2:], mode='nearest')
-        p5_td = self.td_p5([p5, p6_to_p5])
-        
-        # P5_td -> P4_td
-        p5_to_p4 = F.interpolate(p5_td, size=p4.shape[2:], mode='nearest')
-        p4_td = self.td_p4([p4, p5_to_p4])
-        
-        # P4_td -> P3_td
-        p4_to_p3 = F.interpolate(p4_td, size=p3.shape[2:], mode='nearest')
-        p3_td = self.td_p3([p3, p4_to_p3])
-        
-        # BOTTOM-UP PATH - sesuai Figure 3(b)
-        # P3_td -> P4_out
-        p3_to_p4 = F.interpolate(p3_td, size=p4.shape[2:], mode='nearest')
-        p4_out = self.bu_p4([p4, p4_td, p3_to_p4])
-        
-        # P4_out -> P5_out
-        p4_to_p5 = F.interpolate(p4_out, size=p5.shape[2:], mode='nearest')
-        p5_out = self.bu_p5([p5, p5_td, p4_to_p5])
-        
-        # P5_out -> P6_out
-        p5_to_p6 = F.interpolate(p5_out, size=p6.shape[2:], mode='nearest')
-        p6_out = self.bu_p6([p6, p6_td, p5_to_p6])
-        
-        # P6_out -> P7_out
-        p6_to_p7 = F.interpolate(p6_out, size=p7.shape[2:], mode='nearest')
-        p7_out = self.bu_p7([p7, p6_to_p7])
-        
-        return [p3_td, p4_out, p5_out, p6_out, p7_out]
+
+class BiFPNBlock(nn.Module):
+    """
+    Single BiFPN block (one top-down pass, one bottom-up pass).
+    Expects a list of feature maps ordered from smallest stride (P3) -> larger strides (P4, P5)
+    but we'll write to accept inputs as [P3, P4, P5] (P3 highest resolution).
+    All features are expected to have the same number of channels. If not, BiFPN will
+    adapt by a 1x1 conv to match channels.
+    """
+
+    def __init__(self, channels, conv_type=SeparableConvBlock):
+        super().__init__()
+        C = channels
+        # fusion weights
+        self.w1 = WeightedAdd(2)  # for top-down merges with 2 inputs
+        self.w2 = WeightedAdd(3)  # for bottom-up merges with 3 inputs
+
+        # convs after fusion
+        self.p3_td_conv = conv_type(C, C)
+        self.p4_td_conv = conv_type(C, C)
+        self.p5_td_conv = conv_type(C, C)
+
+        self.p3_bu_conv = conv_type(C, C)
+        self.p4_bu_conv = conv_type(C, C)
+        self.p5_bu_conv = conv_type(C, C)
+
+        # if needed, adapt channels of inputs
+        self.adapt_convs = None
+
+    def adapt_input(self, inputs, channels):
+        """Return inputs all adapted to `channels` using 1x1 conv if necessary."""
+        adapted = []
+        if self.adapt_convs is None:
+            self.adapt_convs = nn.ModuleList()
+            for t in inputs:
+                c = t.shape[1]
+                if c != channels:
+                    self.adapt_convs.append(nn.Conv2d(c, channels, 1, 1, 0, bias=False))
+                else:
+                    self.adapt_convs.append(nn.Identity())
+        for conv, t in zip(self.adapt_convs, inputs):
+            adapted.append(conv(t))
+        return adapted
+
+    def forward(self, inputs):
+        # inputs: [P3, P4, P5] where P3 has highest spatial resolution
+        assert len(inputs) == 3, "BiFPNBlock currently supports exactly 3 levels (P3,P4,P5)"
+        # adapt channels if needed
+        C = inputs[0].shape[1]
+        inputs = self.adapt_input(inputs, C)
+        p3, p4, p5 = inputs
+
+        # top-down pathway
+        p5_up = F.interpolate(p5, size=(p4.shape[2], p4.shape[3]), mode='nearest')
+        p4_td = self.w1([p4, p5_up])
+        p4_td = self.p4_td_conv(p4_td)
+
+        p4_up = F.interpolate(p4_td, size=(p3.shape[2], p3.shape[3]), mode='nearest')
+        p3_td = self.w1([p3, p4_up])
+        p3_td = self.p3_td_conv(p3_td)
+
+        # bottom-up pathway
+        p3_down = F.max_pool2d(p3_td, kernel_size=2)
+        # combine p3_down, p4, p4_td (three inputs) -> p4_bu
+        p4_bu = self.w2([p4, p4_td, p3_down])
+        p4_bu = self.p4_bu_conv(p4_bu)
+
+        p4_down = F.max_pool2d(p4_bu, kernel_size=2)
+        p5_bu = self.w1([p5, p4_down])
+        p5_bu = self.p5_bu_conv(p5_bu)
+
+        return [p3_td, p4_bu, p5_bu]
+
 
 class BiFPN(nn.Module):
-    """Complete BiFPN dengan 3 layers - sesuai EfficientDet-D0"""
-    def __init__(self, channels, num_layers=3, epsilon=1e-4):
-        super(BiFPN, self).__init__()
+    """
+    Stack `num_layers` of BiFPNBlock. Input: list of feature maps [P3,P4,P5].
+    All outputs keep same channel count as inputs (after optional adapt conv).
+
+    Args:
+        channels: number of channels to use internally (if inputs differ, they're adapted)
+        num_layers: number of stacked BiFPN blocks (typical: 2 or 3)
+    """
+
+    def __init__(self, channels, num_layers=2):
+        super().__init__()
+        self.channels = channels
         self.num_layers = num_layers
-        
-        # ✅ SESUAI PAPER: EfficientDet-D0 menggunakan 64 channels untuk BiFPN
-        bifpn_channels = 64  # Fixed sesuai paper Table 1
-        
-        # Projection layers untuk P3-P5 dari backbone ke BiFPN channels
-        self.proj_p3 = nn.Conv2d(256, bifpn_channels, 1)   # P3: 256 -> 64
-        self.proj_p4 = nn.Conv2d(512, bifpn_channels, 1)   # P4: 512 -> 64  
-        self.proj_p5 = nn.Conv2d(1024, bifpn_channels, 1)  # P5: 1024 -> 64
-        
-        # ✅ SESUAI PAPER: Generate P6 dan P7 dari P5
-        # P6 = Conv3x3 stride2(P5)
-        self.p6_conv = nn.Conv2d(bifpn_channels, bifpn_channels, 3, stride=2, padding=1)
-        # P7 = Conv3x3 stride2(ReLU(P6))  
-        self.p7_conv = nn.Conv2d(bifpn_channels, bifpn_channels, 3, stride=2, padding=1)
-        
-        # ✅ SESUAI PAPER: 3 BiFPN layers untuk EfficientDet-D0
-        self.bifpn_layers = nn.ModuleList([
-            BiFPN_Layer(bifpn_channels, epsilon) for _ in range(num_layers)
-        ])
-        
-        # Output projection kembali ke YOLO channels
-        self.out_p3 = nn.Conv2d(bifpn_channels, 256, 1)  # 64 -> 256
-        self.out_p4 = nn.Conv2d(bifpn_channels, 512, 1)  # 64 -> 512
-        self.out_p5 = nn.Conv2d(bifpn_channels, 1024, 1) # 64 -> 1024
-        
+        self.blocks = nn.ModuleList([BiFPNBlock(channels) for _ in range(num_layers)])
+
     def forward(self, inputs):
-        # inputs: [P3, P4, P5] dari YOLO backbone
-        p3, p4, p5 = inputs
-        
-        # Project ke BiFPN channels (64)
-        p3_proj = self.proj_p3(p3)  # (B, 64, H/8, W/8)
-        p4_proj = self.proj_p4(p4)  # (B, 64, H/16, W/16)
-        p5_proj = self.proj_p5(p5)  # (B, 64, H/32, W/32)
-        
-        # Generate P6 dan P7 sesuai paper
-        p6 = self.p6_conv(p5_proj)           # (B, 64, H/64, W/64)
-        p7 = self.p7_conv(F.relu(p6))        # (B, 64, H/128, W/128)
-        
-        # Apply 3 BiFPN layers
-        features = [p3_proj, p4_proj, p5_proj, p6, p7]
-        for bifpn_layer in self.bifpn_layers:
-            features = bifpn_layer(features)
-        
-        # Project kembali ke YOLO channels (hanya P3-P5 yang digunakan)
-        p3_out = self.out_p3(features[0])  # P3 enhanced
-        p4_out = self.out_p4(features[1])  # P4 enhanced  
-        p5_out = self.out_p5(features[2])  # P5 enhanced
-        
-        return [p3_out, p4_out, p5_out]
+        """inputs: list/tuple of 3 tensors [P3,P4,P5]"""
+        feats = inputs
+        for b in self.blocks:
+            feats = b(feats)
+        return feats
+
+
+# === Minimal test snippet (only runs if file executed directly) ===
+if __name__ == '__main__':
+    # quick smoke test
+    p3 = torch.randn(1, 256, 80, 80)
+    p4 = torch.randn(1, 256, 40, 40)
+    p5 = torch.randn(1, 256, 20, 20)
+    bifpn = BiFPN(256, num_layers=2)
+    out = bifpn([p3, p4, p5])
+    for i, o in enumerate(out):
+        print(f'out[{i}]', o.shape)
+
