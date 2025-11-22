@@ -28,5 +28,5 @@ head:
 - [9, 1, Conv, [256, 1, 1]] # proj P5
 
 
-- [[10,11,12], 1, BiFPN, [256, 2]]  # node 13
-- [13, 1, Detect, [nc]]             # langsung pakai output BiFPN
+- [[10,11,12], 1, BiFPN, [256, 2]]   # BiFPN → output node 13
+- [[13], 1, Detect, [nc]]            # Detect menerima LIST, bukan INT

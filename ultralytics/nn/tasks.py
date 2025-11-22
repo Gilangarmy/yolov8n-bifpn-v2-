@@ -1627,18 +1627,20 @@ def parse_model(d, ch, verbose=True):
             c2 = sum(ch[x] for x in f)
         # Dalam parse_model function:
         elif m is BiFPN:
-        # f adalah list index fitur input (misal [15,18,21])
-        # args berupa: [channels, num_layers]
-            c_in = [ch[x] for x in f]
-        # kita samakan seluruh channel fitur input dengan channel argumen
-            c2 = args[0] # output channels per level (P3,P4,P5)
-        # set channel output untuk 3 level BiFPN
-            for i, fi in enumerate(f):
-                ch[fi] = c2
-        # modul menghasilkan 3 fitur, sehingga output = 3 fitur berturut
-        # tetapi Ultralytics bertumpu pada 1 output node, jadi kita handle sebagai fitur list
-        # assign jumlah channel ke current node (index i)
-            ch[i] = c2   
+            c2 = args[0]  # channels
+            # input channels diambil dari f
+            # buat layer
+            module = m(*args) 
+
+            # eksekusi forward dummy untuk mengetahui output count
+            # tapi cukup tahu bahwa ini 3 output
+            ch[i] = c2  # untuk node pertama
+            ch.append(c2)
+            ch.append(c2)
+
+            # tandai module sebagai multi_output
+            module._multi_output = True
+   
         elif m in frozenset(
             {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):
