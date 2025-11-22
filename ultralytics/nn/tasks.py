@@ -1623,7 +1623,7 @@ def parse_model(d, ch, verbose=True):
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
         # Update parse_model function
-        elif m in {Concat, BiFPN_Concat2, BiFPN_Concat3}:
+        elif m in Concat:
             c2 = sum(ch[x] for x in f)
         elif m is BiFPN:
             # BiFPN mengambil [p3, p4, p5] dan output [p3, p4, p5]
